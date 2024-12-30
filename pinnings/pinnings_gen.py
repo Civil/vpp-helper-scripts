@@ -4,7 +4,6 @@ import subprocess
 import re
 import sys
 
-
 def parse_lstopo():
     result = subprocess.run(['/usr/bin/lstopo'], capture_output=True, check=True)
     numa2core = collections.defaultdict(list)
@@ -67,11 +66,27 @@ def parse_dev_line(params):
     return res
 
 
+def parse_corelist(corelist):
+    res = []
+    core_groups = corelist.split(',')
+    for group in core_groups:
+        core_range = group.split('-')
+        if len(core_range) == 1:
+            res.append(int(core_range))
+            continue
+        for c in range(int(core_range[0]), int(core_range[1])+1):
+            res.append(c)
+
+    return res
+
 def generate_pinnings(filename="/etc/vpp/startup.conf"):
     numa2core, numa2ht, pci2numa, _ = parse_lstopo()
-    exclude_core = 0
+    core2worker = {}
+    exclude_cores = []
+    allowed_cores = []
     dpdk_section = False
     main_core_re = re.compile(r'^\s+main-core\s+([0-9]+)')
+    corelist_re = re.compile(r'^\s+corelist-workers\s+([-0-9,]+)')
     dev_re = re.compile(r'^\s+dev\s+([^ ]+)\s+{\s*(.*?)\s*}(.*)$')
     used_cores = {}
     with open(filename, 'r', encoding='utf-8') as cfg:
@@ -79,10 +94,45 @@ def generate_pinnings(filename="/etc/vpp/startup.conf"):
             if not dpdk_section:
                 m = main_core_re.match(line)
                 if m:
-                    exclude_core = m.group(1)
+                    exclude_cores.append(int(m.group(1)))
                     continue
+                m = corelist_re.match(line)
+                if m:
+                    allowed_cores = parse_corelist(m.group(1))
                 if line.startswith("dpdk"):
                     dpdk_section = True
+                    if len(exclude_cores) == 0:
+                        exclude_cores.append(0)
+
+                    worker = 0
+                    for numa in sorted(numa2core):
+                        cores_to_remove = []
+                        for core in sorted(numa2core[numa]):
+                            if core in exclude_cores:
+                                cores_to_remove.append(core)
+                                continue
+                            if core not in allowed_cores:
+                                cores_to_remove.append(core)
+                                continue
+                            core2worker[core] = worker
+                            worker = worker+1
+                        for core in cores_to_remove:
+                            numa2core[numa].remove(core)
+                    for numa in sorted(numa2ht):
+                        cores_to_remove = []
+                        for core in sorted(numa2ht[numa]):
+                            if core in exclude_cores:
+                                cores_to_remove.append(core)
+                                continue
+                            if core not in allowed_cores:
+                                cores_to_remove.append(core)
+                                continue
+                            core2worker[core] = worker
+                            worker = worker+1
+
+                        for core in cores_to_remove:
+                            numa2ht[numa].remove(core)
+
                 continue
             if line.startswith("}"):
                 break
@@ -104,12 +154,6 @@ def generate_pinnings(filename="/etc/vpp/startup.conf"):
                             core = numa2ht[numa].pop(0)
                         else:
                             core = numa2core[numa].pop(0)
-                        if core == exclude_core:
-                            # Getting another core, as that one is ocupied by main thread
-                            if use_ht:
-                                core = numa2ht[numa].pop(0)
-                            else:
-                                core = numa2core[numa].pop(0)
                     except IndexError:
                         print(f'ERROR! Cannot get core in numa={numa} for dev={pci_id} name={params["name"]} queue={i} - no cores left in the pool', flush=True, file=sys.stderr)
                         sys.exit(1)
@@ -118,7 +162,7 @@ def generate_pinnings(filename="/etc/vpp/startup.conf"):
                         print(f'ERROR! Core {core} was already used by {used_cores[core]}', flush=True, file=sys.stderr)
                         sys.exit(1)
                     used_cores[core] = params["name"]
-                    print(f'set int rx-placement {params["name"]} queue {i} worker {core}', flush=True, file=sys.stdout)
+                    print(f'set int rx-placement {params["name"]} queue {i} worker {core2worker[core]}', flush=True, file=sys.stdout)
                 print()
 
 
